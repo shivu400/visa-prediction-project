@@ -1,0 +1,23 @@
+[
+    {
+        "name": "random_forest_v1",
+        "filename": "random_forest_v1.joblib",
+        "accuracy": 0.914,
+        "algorithm": "RandomForestClassifier",
+        "timestamp": "2025-09-06T14:28:27.126358"
+    },
+    {
+        "name": "xgboost_v1",
+        "filename": "xgboost_v1.joblib",
+        "accuracy": 0.9105,
+        "algorithm": "XGBClassifier",
+        "timestamp": "2025-09-06T14:28:27.636052"
+    },
+    {
+        "name": "lightgbm_v1",
+        "filename": "lightgbm_v1.joblib",
+        "accuracy": 0.9125,
+        "algorithm": "LGBMClassifier",
+        "timestamp": "2025-09-06T14:28:29.994831"
+    }
+]

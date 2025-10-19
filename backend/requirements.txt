@@ -1,0 +1,8 @@
+pandas
+faker
+scikit-learn
+matplotlib
+seaborn
+joblib
+fastapi
+uvicorn
