@@ -7,7 +7,7 @@ PDF_FILENAME = "YOUR_SAMPLE_PDF.pdf"
 
 try:
     pdf_document = fitz.open(PDF_FILENAME)
-except Exception as e:
+except Exception:
     print(f"Error: Could not open file '{PDF_FILENAME}'.")
     print("Please make sure the file is in the same folder as this script.")
     sys.exit(1)

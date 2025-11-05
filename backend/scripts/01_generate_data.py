@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from faker import Faker
 import random
 import os # <-- IMPORT OS
 
@@ -34,15 +33,24 @@ for _ in range(NUM_RECORDS):
     has_criminal_record = np.random.choice([0, 1], p=[0.95, 0.05])
     
     approval_score = 0
-    if monthly_income_usd > 4000: approval_score += 2
-    if bank_balance_usd > 50000: approval_score += 3
-    if education_level in ['Masters', 'PhD']: approval_score += 2
-    if prev_countries_visited > 5: approval_score += 1
-    if has_return_ticket == 1: approval_score += 1
-    if prev_visa_rejections > 0: approval_score -= (prev_visa_rejections * 3)
-    if has_criminal_record == 1: approval_score -= 5
-    if monthly_income_usd < 1000: approval_score -= 2
-    if bank_balance_usd < 5000: approval_score -= 2
+    if monthly_income_usd > 4000: 
+        approval_score += 2
+    if bank_balance_usd > 50000: 
+        approval_score += 3
+    if education_level in ['Masters', 'PhD']: 
+        approval_score += 2
+    if prev_countries_visited > 5: 
+        approval_score += 1
+    if has_return_ticket == 1: 
+        approval_score += 1
+    if prev_visa_rejections > 0: 
+        approval_score -= (prev_visa_rejections * 3)
+    if has_criminal_record == 1: 
+        approval_score -= 5
+    if monthly_income_usd < 1000: 
+        approval_score -= 2
+    if bank_balance_usd < 5000: 
+        approval_score -= 2
     
     prob_approval = 1 / (1 + np.exp(-approval_score))
     visa_approved = 1 if np.random.rand() < prob_approval else 0
