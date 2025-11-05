@@ -1,19 +1,30 @@
-from dotenv import load_dotenv
-load_dotenv()
+# --- All Imports Moved to Top ---
 import sqlite3
 import uuid
 import json
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-import joblib
-import pandas as pd
 import os
 import re
-import fitz
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
 from fastapi.staticfiles import StaticFiles
-import shap # Import SHAP
+
+import joblib
+import pandas as pd
+import shap
+import fitz  # PyMuPDF
+
+from langchain_community.document_loaders import TextLoader
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
+
+# --- Load Environment Variables AFTER imports ---
+load_dotenv()
 
 
 # --- App Initialization, CORS ---
@@ -21,14 +32,12 @@ app = FastAPI(title="Visa Prediction API")
 origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# --- Smart Model & ⭐️ SHAP Explainer Loading (Corrected) ---
-MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', 'models')
-REGISTRY_PATH = os.path.join(MODELS_DIR, 'model_registry.json')
-ML_MODEL_ACCURACY = 0
-model = None
-explainer = None 
-
+# --- Smart Model & SHAP Explainer Loading ---
 try:
+    # ⭐️ FIX: Path from app/main.py -> backend/models/
+    MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
+    REGISTRY_PATH = os.path.join(MODELS_DIR, 'model_registry.json')
+
     with open(REGISTRY_PATH, 'r') as f:
         model_registry = json.load(f)
     best_model_info = max(model_registry, key=lambda x: x['accuracy'])
@@ -36,39 +45,44 @@ try:
     ML_MODEL_ACCURACY = best_model_info['accuracy'] * 100
     print(f"--- Loading best model: {best_model_info['name']} with accuracy {ML_MODEL_ACCURACY:.2f}% ---")
     
-    # Load the entire pipeline
     model = joblib.load(MODEL_PATH)
-    
-    # ⭐️ FIX: Extract the final classifier (the tree model) from the pipeline.
-    # The pipeline is a list of steps. model[-1] gets the last step.
     classifier = model[-1] 
     
     print("--- Initializing SHAP TreeExplainer... ---")
-    
-    # ⭐️ FIX: Initialize the explainer with the CLASSIFIER, not the whole pipeline
     explainer = shap.TreeExplainer(classifier)
     print("--- SHAP Explainer loaded successfully. ---")
 
 except Exception as e:
     print(f"--- FATAL ERROR: Model or SHAP Explainer failed to load: {e} ---")
     print("--- Please ensure 'model_registry.json' is correct and 'shap' is installed. ---")
-    exit()
+    model = None
+    explainer = None
 
 # --- DB Path & Static Files ---
-DB_PATH = os.path.join(os.path.dirname(__file__), 'visa_predictions.db')
-uploads_dir = os.path.join(os.path.dirname(__file__), '..', 'uploads')
+# ⭐️ FIX: Path from app/main.py -> backend/visa_predictions.db
+DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'visa_predictions.db')
+# ⭐️ FIX: Path from app/main.py -> root/uploads/
+uploads_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'uploads') 
 os.makedirs(uploads_dir, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
 
 # --- Pydantic Data Models ---
 class VisaApplication(BaseModel):
-    # ... (all fields remain the same)
-    full_name: str; age: int; nationality: str; marital_status: str
-    education_level: str; destination_country: str; visa_type: str
-    duration_of_stay_months: int; monthly_income_inr: int
-    bank_balance_inr: int; prev_countries_visited: int
-    prev_visa_rejections: int; has_return_ticket: int
-    has_criminal_record: int; pdf_filename: Optional[str] = None
+    full_name: str
+    age: int
+    nationality: str
+    marital_status: str
+    education_level: str
+    destination_country: str
+    visa_type: str
+    duration_of_stay_months: int
+    monthly_income_inr: int
+    bank_balance_inr: int
+    prev_countries_visited: int
+    prev_visa_rejections: int
+    has_return_ticket: int
+    has_criminal_record: int
+    pdf_filename: Optional[str] = None
 
 class VerificationUpdate(BaseModel):
     verified_status: str
@@ -89,53 +103,51 @@ VISA_RULES = {
 # --- API Endpoints ---
 @app.post("/predict")
 def predict_visa_approval(application: VisaApplication):
+    if not model or not explainer:
+        raise HTTPException(status_code=500, detail="Model or SHAP Explainer is not loaded. Check server logs.")
+
     # --- 1. PREPARE DATA ---
     model_input_dict = application.model_dump(exclude={'pdf_filename', 'full_name'})
     model_input_dict['monthly_income_usd'] = round(application.monthly_income_inr / APPROX_INR_PER_USD)
     model_input_dict['bank_balance_usd'] = round(application.bank_balance_inr / APPROX_INR_PER_USD)
     model_input_dict['duration_of_stay'] = application.duration_of_stay_months * 30
     
-    if 'monthly_income_inr' in model_input_dict: del model_input_dict['monthly_income_inr']
-    if 'bank_balance_inr' in model_input_dict: del model_input_dict['bank_balance_inr']
-    if 'duration_of_stay_months' in model_input_dict: del model_input_dict['duration_of_stay_months']
+    if 'monthly_income_inr' in model_input_dict:
+        del model_input_dict['monthly_income_inr']
+    if 'bank_balance_inr' in model_input_dict:
+        del model_input_dict['bank_balance_inr']
+    if 'duration_of_stay_months' in model_input_dict:
+        del model_input_dict['duration_of_stay_months']
     
     input_data = pd.DataFrame([model_input_dict])
 
     # --- 2. GET PREDICTION ---
-    # We still use the *full pipeline* to get the prediction
     prediction = model.predict(input_data)[0]
     confidence_score = model.predict_proba(input_data)[0]
     approval_probability = confidence_score[1]
     risk_level = "low"
-    if approval_probability < 0.4: risk_level = "high"
-    elif approval_probability < 0.7: risk_level = "medium"
+    
+    if approval_probability < 0.4:
+        risk_level = "high"
+    elif approval_probability < 0.7:
+        risk_level = "medium"
 
-    # --- 3. ⭐️ NEW: GET SHAP EXPLANATION (Corrected) ---
+    # --- 3. GET SHAP EXPLANATION ---
     feature_importance = []
     try:
-        # ⭐️ FIX: We must manually preprocess the data for the explainer.
-        # model[:-1] creates a new, temporary pipeline containing all steps *except* the last one.
         preprocessor = model[:-1]
-        
-        # ⭐️ FIX: Transform the input data using the preprocessor pipeline
         processed_input = preprocessor.transform(input_data)
-        
-        # ⭐️ FIX: Get feature names *after* preprocessing
-        # This gets the one-hot encoded and scaled feature names
         feature_names = preprocessor.get_feature_names_out()
-
-        # Get SHAP values from the *processed* data
         shap_values = explainer.shap_values(processed_input)
         
-        shap_values_for_approval = shap_values[1][0]
-        
-        # Combine feature names with their impact values
+        if isinstance(shap_values, list) and len(shap_values) > 1:
+            shap_values_for_approval = shap_values[1][0]
+        else:
+            shap_values_for_approval = shap_values[0] 
+
         contributions = dict(zip(feature_names, shap_values_for_approval))
-        
-        # Sort by the absolute impact, high to low, and take top 5
         sorted_contributions = sorted(contributions.items(), key=lambda item: abs(item[1]), reverse=True)[:5]
         
-        # Format for a clean JSON response
         feature_importance = [
             {"feature": feature.replace('_', ' ').title(), "impact": impact}
             for feature, impact in sorted_contributions
@@ -147,15 +159,16 @@ def predict_visa_approval(application: VisaApplication):
 
     # --- 4. SAVE TO DATABASE ---
     conn = get_db_connection()
-    # ... (Database insertion code remains the same)
     cursor = conn.cursor()
+    
+    # ⭐️ TYPO FIX: Removed extra dot from 'cursor..execute'
     cursor.execute(
         '''INSERT INTO predictions (
             full_name, age, nationality, visa_type, destination_country,
             monthly_income_inr, bank_balance_inr, prev_visa_rejections,
             has_criminal_record, prediction_label, approval_probability,
             risk_assessment, pdf_path, duration_of_stay_months, is_verified, verified_status
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)''',
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)''',
         (
             application.full_name, application.age, application.nationality,
             application.visa_type, application.destination_country,
@@ -171,7 +184,6 @@ def predict_visa_approval(application: VisaApplication):
 
     # --- 5. GENERATE CONCERNS & FINAL RESPONSE ---
     concerns = []
-    # ... (Rules/Concerns logic remains the same)
     rules = VISA_RULES.get(application.visa_type, VISA_RULES.get("Tourist", {}))
     if application.bank_balance_inr < rules.get("min_bank_balance", 0):
         concerns.append(f"Bank balance is below the recommended INR {rules.get('min_bank_balance', 0):,} for a {application.visa_type} visa.")
@@ -183,12 +195,9 @@ def predict_visa_approval(application: VisaApplication):
         "risk_assessment": risk_level,
         "areas_of_concern": concerns,
         "applicant_info": application.model_dump(),
-        "feature_importance": feature_importance # Add explanation to the response
+        "feature_importance": feature_importance
     }
     return result
-
-# --- All Other Endpoints ---
-# (They remain exactly the same as before)
 
 @app.get("/history")
 def get_history():
@@ -201,8 +210,10 @@ def get_history():
 async def upload_pdf(file: UploadFile = File(...)):
     unique_filename = f"{uuid.uuid4()}_{file.filename}"
     file_path = os.path.join(uploads_dir, unique_filename)
+    
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
+        
     extracted_data = {}
     FIELD_NAME_MAP = {
         'FullName': 'full_name', 'Applicant_Name': 'full_name', 'Age': 'age',
@@ -211,6 +222,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         'StayDuration_Months': 'duration_of_stay_months', 'Income_INR': 'monthly_income_inr',
         'BankBalance_INR': 'bank_balance_inr',
     }
+    
     try:
         pdf_document = fitz.open(file_path)
         for page in pdf_document:
@@ -218,27 +230,42 @@ async def upload_pdf(file: UploadFile = File(...)):
                 if widget.field_name in FIELD_NAME_MAP:
                     our_key = FIELD_NAME_MAP[widget.field_name]
                     extracted_data[our_key] = widget.field_value
+        
         if not extracted_data:
             print("--- No form fields found, falling back to Regex text search ---")
             full_text = ""
             for page in pdf_document:
                 full_text += page.get_text()
+            
             age_match = re.search(r"Age:\s*(\d+)", full_text, re.IGNORECASE)
-            if age_match: extracted_data['age'] = int(age_match.group(1))
+            if age_match:
+                extracted_data['age'] = int(age_match.group(1))
+            
             income_match_inr = re.search(r"Monthly Income.*?₹\s*([\d,]+)", full_text, re.IGNORECASE)
-            if income_match_inr: extracted_data['monthly_income_inr'] = int(income_match_inr.group(1).replace(',', ''))
+            if income_match_inr:
+                extracted_data['monthly_income_inr'] = int(income_match_inr.group(1).replace(',', ''))
+            
             balance_match_inr = re.search(r"Bank Balance.*?₹\s*([\d,]+)", full_text, re.IGNORECASE)
-            if balance_match_inr: extracted_data['bank_balance_inr'] = int(balance_match_inr.group(1).replace(',', ''))
+            if balance_match_inr:
+                extracted_data['bank_balance_inr'] = int(balance_match_inr.group(1).replace(',', ''))
+            
             name_match = re.search(r"Full Name:\s*(.*)", full_text, re.IGNORECASE)
-            if name_match: extracted_data['full_name'] = name_match.group(1).strip()
+            if name_match:
+                extracted_data['full_name'] = name_match.group(1).strip()
+            
             nationality_match = re.search(r"Nationality:\s*(.*)", full_text, re.IGNORECASE)
-            if nationality_match: extracted_data['nationality'] = nationality_match.group(1).strip()
+            if nationality_match:
+                extracted_data['nationality'] = nationality_match.group(1).strip()
+            
             marital_match = re.search(r"Marital Status:\s*(.*)", full_text, re.IGNORECASE)
-            if marital_match: extracted_data['marital_status'] = marital_match.group(1).strip()
+            if marital_match:
+                extracted_data['marital_status'] = marital_match.group(1).strip()
+            
         pdf_document.close()
     except Exception as e:
         print(f"Error processing PDF: {e}")
         return {"error": f"Failed to process PDF: {str(e)}", "extracted_data": {}, "saved_filename": None}
+    
     print(f"Extracted data: {extracted_data}")
     return {"extracted_data": extracted_data, "saved_filename": unique_filename}
 
@@ -274,7 +301,7 @@ def get_insights():
 
 @app.get("/user/all-predictions")
 def get_user_all_predictions():
-    conn = get_db_.connection()
+    conn = get_db_connection()
     predictions = conn.execute('SELECT id, full_name, nationality, visa_type, destination_country, prediction_label, approval_probability, risk_assessment, timestamp, duration_of_stay_months FROM predictions ORDER BY timestamp DESC').fetchall()
     conn.close()
     return [dict(row) for row in predictions]
@@ -296,12 +323,15 @@ def get_country_analytics():
 def verify_prediction(prediction_id: int, update: VerificationUpdate):
     if update.verified_status not in ["Approved", "Rejected"]:
         raise HTTPException(status_code=400, detail="Invalid verification status. Must be 'Approved' or 'Rejected'.")
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     prediction = cursor.execute('SELECT * FROM predictions WHERE id = ?', (prediction_id,)).fetchone()
+    
     if not prediction:
         conn.close()
         raise HTTPException(status_code=404, detail="Prediction not found")
+        
     cursor.execute(
         '''UPDATE predictions 
            SET is_verified = 1, verified_status = ? 
@@ -312,22 +342,12 @@ def verify_prediction(prediction_id: int, update: VerificationUpdate):
     updated_prediction = cursor.execute('SELECT * FROM predictions WHERE id = ?', (prediction_id,)).fetchone()
     conn.close()
     return dict(updated_prediction)
-    # ... (all your other endpoints, like /admin/verify/{prediction_id}) ...
 
-# --- ⭐️ NEW: AI Chatbot (RAG) Dependencies ⭐️ ---
-from langchain_community.document_loaders import TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.chains import ConversationalRetrievalChain
-
-# --- ⭐️ NEW: Initialize Chatbot (RAG Pipeline) ⭐️ ---
-# This section will run once on startup
+# --- Initialize Chatbot (RAG Pipeline) ---
+qa_chain = None
 try:
     print("--- Initializing AI Chatbot (RAG)... ---")
     
-    # Set up OpenRouter client
-    # It automatically finds the OPENROUTER_API_KEY environment variable
     openrouter_llm = ChatOpenAI(
         model="meta-llama/llama-4-scout:free",
         openai_api_base="https://openrouter.ai/api/v1",
@@ -335,61 +355,53 @@ try:
         temperature=0.1
     )
     
-    # 1. Load the knowledge base
-    KNOWLEDGE_BASE_PATH = os.path.join(os.path.dirname(__file__), 'knowledge_base.txt')
+    # ⭐️ FIX: Path from app/main.py -> backend/knowledge_base.txt
+    KNOWLEDGE_BASE_PATH = os.path.join(os.path.dirname(__file__), '..', 'knowledge_base.txt')
     loader = TextLoader(KNOWLEDGE_BASE_PATH)
     documents = loader.load()
 
-    # 2. Split the text into chunks
     text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
     docs = text_splitter.split_documents(documents)
 
-    # 3. Create embeddings (numerical representations)
     embeddings = OpenAIEmbeddings(
         openai_api_base="https://openrouter.ai/api/v1",
         openai_api_key=os.environ.get("OPENROUTER_API_KEY")
     )
 
-    # 4. Create a vector store (in-memory database)
     vectorstore = FAISS.from_documents(docs, embeddings)
 
-    # 5. Create the retrieval chain
-    # This chain "retrieves" docs and then "generates" an answer
+    # ⭐️ TYPO FIX: Changed 'as_ri()' to 'as_retriever()'
     qa_chain = ConversationalRetrievalChain.from_llm(
         llm=openrouter_llm,
         retriever=vectorstore.as_retriever(),
         return_source_documents=False
     )
     
-    print(qa_chain)
-    chat_history = [] # In-memory chat history
     print("--- AI Chatbot loaded successfully. ---")
 
 except ImportError:
     print("--- AI Chatbot libraries not found. Skipping chatbot initialization. ---")
-    qa_chain = None
 except Exception as e:
     print(f"--- ERROR initializing AI Chatbot: {e} ---")
     print("--- Check if OPENROUTER_API_KEY is set correctly. ---")
-    qa_chain = None
 
-# --- ⭐️ NEW: Chatbot Pydantic Models ⭐️ ---
+# --- Chatbot Pydantic Models ---
 class ChatQuery(BaseModel):
     query: str
 
 class ChatResponse(BaseModel):
     answer: str
 
-# --- ⭐️ NEW: Chatbot API Endpoint ⭐️ ---
+# --- Chatbot API Endpoint ---
 @app.post("/chat", response_model=ChatResponse)
 async def handle_chat_query(query: ChatQuery):
     if qa_chain is None:
         raise HTTPException(status_code=500, detail="Chatbot is not initialized. Check server logs.")
     
     try:
-        # Pass the query and an empty chat history to the chain
         result = qa_chain.invoke({"question": query.query, "chat_history": []})
         return ChatResponse(answer=result['answer'])
     except Exception as e:
         print(f"--- Chat Error: {e} ---")
+        # ⭐️ TYPO FIX: Changed '50Do' to '500'
         raise HTTPException(status_code=500, detail="Error processing chat query.")
